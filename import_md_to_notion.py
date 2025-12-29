@@ -2,13 +2,16 @@ import os
 import sys
 import argparse
 import time
+import copy
 from notion_client import Client
+from notion_client.errors import APIResponseError, RequestTimeoutError
 from martian import markdown_to_blocks
 import re
 
 FENCE_RE = re.compile(r"^(\s*)(```|~~~)")
 SINGLELINE_DBLDOLLAR_RE = re.compile(r"^(\s*)\$\$(.+?)\$\$\s*$")
 ONLY_DBLDOLLAR_RE = re.compile(r"^(\s*)\$\$\s*$")
+MAX_RICH_TEXT_UNITS = 2000
 
 
 def preprocess_display_math(md: str) -> str:
@@ -104,9 +107,129 @@ def preprocess_display_math(md: str) -> str:
     return "".join(out)
 
 
-def chunk(lst, n=100):
-    for i in range(0, len(lst), n):
-        yield lst[i : i + n]
+def _utf16_units(s: str) -> int:
+    # JS string length ~= number of UTF-16 code units
+    # utf-16-le encodes 2 bytes per code unit; no BOM in -le
+    return len(s.encode("utf-16-le")) // 2
+
+def _smart_chunk_text_utf16(s: str, max_units: int = MAX_RICH_TEXT_UNITS):
+    """
+    Split a string into chunks whose UTF-16 code unit length <= max_units.
+    Prefer splitting at newline boundaries near the end.
+    """
+    chunks = []
+    n = len(s)
+    start = 0
+
+    while start < n:
+        units = 0
+        i = start
+        last_nl = None
+        last_nl_units = 0
+
+        # scan forward until we hit the unit budget
+        while i < n:
+            ch = s[i]
+            ch_units = 2 if ord(ch) > 0xFFFF else 1  # surrogate-pair chars
+            if units + ch_units > max_units:
+                break
+            units += ch_units
+            if ch == "\n":
+                last_nl = i + 1
+                last_nl_units = units
+            i += 1
+
+        if i == start:
+            # Shouldn't happen (since ch_units is max 2 and max_units is 2000),
+            # but guard anyway to avoid infinite loops.
+            i = min(start + 1, n)
+
+        # Prefer newline split if it's not too far back
+        if last_nl is not None and last_nl_units >= int(max_units * 0.6):
+            cut = last_nl
+        else:
+            cut = i
+
+        chunks.append(s[start:cut])
+        start = cut
+
+    return chunks
+
+def _split_rich_text_item(rt: dict):
+    """
+    If rt is a text rich_text item whose content is > 2000 UTF-16 units, split it.
+    Preserve annotations and link.
+    """
+    if rt.get("type") != "text":
+        return [rt]
+
+    text_obj = rt.get("text") or {}
+    content = text_obj.get("content", "")
+    if _utf16_units(content) <= MAX_RICH_TEXT_UNITS:
+        return [rt]
+
+    parts = _smart_chunk_text_utf16(content, MAX_RICH_TEXT_UNITS)
+    out = []
+    for part in parts:
+        rt2 = copy.deepcopy(rt)
+        rt2["text"]["content"] = part
+        out.append(rt2)
+    return out
+
+
+def _sanitize_any(obj):
+    """
+    Recursively walk dict/list structures and sanitize any `rich_text` lists found.
+    This catches paragraphs, headings, list items, code blocks, callouts, etc.
+    """
+    if isinstance(obj, dict):
+        if "rich_text" in obj and isinstance(obj["rich_text"], list):
+            new_rts = []
+            for rt in obj["rich_text"]:
+                new_rts.extend(_split_rich_text_item(rt))
+            obj["rich_text"] = new_rts
+
+        for v in obj.values():
+            _sanitize_any(v)
+
+    elif isinstance(obj, list):
+        for item in obj:
+            _sanitize_any(item)
+
+
+def sanitize_blocks_for_notion(blocks: list[dict]) -> list[dict]:
+    # Modify in place, return same list for convenience
+    _sanitize_any(blocks)
+    return blocks
+
+
+def find_oversize_rich_text(blocks, limit=MAX_RICH_TEXT_UNITS, max_print=10):
+    offenders = []
+
+    def walk(obj, path="root"):
+        if isinstance(obj, dict):
+            if "rich_text" in obj and isinstance(obj["rich_text"], list):
+                for idx, rt in enumerate(obj["rich_text"]):
+                    if rt.get("type") == "text":
+                        c = (rt.get("text") or {}).get("content", "")
+                        u = _utf16_units(c)
+                        if u > limit:
+                            offenders.append((path, idx, u, c[:120]))
+            for k, v in obj.items():
+                walk(v, f"{path}.{k}")
+        elif isinstance(obj, list):
+            for j, it in enumerate(obj):
+                walk(it, f"{path}[{j}]")
+
+    walk(blocks, "blocks")
+
+    if offenders:
+        print(f"⚠️ Found {len(offenders)} rich_text items still over {limit} UTF-16 units.")
+        for o in offenders[:max_print]:
+            print("  ", o[0], "rich_text[", o[1], "] units=", o[2], "preview=", repr(o[3]))
+    else:
+        print(f"✅ No rich_text items over {limit} UTF-16 units.")
+    return offenders
 
 
 def main():
@@ -124,11 +247,11 @@ def main():
         help="Target Notion page ID (with or without hyphens). Can get this from the shareable link of a page",
     )
     parser.add_argument("--token-env", default="NOTION_TOKEN", help="Env var for Notion token (default: NOTION_TOKEN)")
-    parser.add_argument("--batch-size", type=int, default=100, help="Blocks per request (max: 100)")
+    parser.add_argument("--batch-size", type=int, default=50, help="Blocks per request (max: 50)")
     parser.add_argument("--sleep", type=float, default=0.35, help="Sleep between successful requests (default: 0.35s)")
     parser.add_argument("--start", type=int, default=0, help="Skip the first N blocks (useful to resume)")
-    parser.add_argument("--max-retries", type=int, default=1, help="Max retries on transient failures (default: 1)")
-    parser.add_argument("--skip-bad-blocks", action="store_false", help="Skip a single bad block instead of aborting")
+    parser.add_argument("--max-retries", type=int, default=2, help="Max retries on transient failures (default: 2)")
+    parser.add_argument("--skip-bad-blocks", action="store_true", default=False, help="Skip a single bad block instead of aborting")
 
     args = parser.parse_args()
 
@@ -141,12 +264,9 @@ def main():
         print(f"Error: environment variable {token_env} is not set. Example: export {token_env}='secret_...'")
         sys.exit(1)
 
-    md_path = args.md_path
-    page_id = args.page_id
-
     notion = Client(auth=os.environ[token_env])
 
-    with open(md_path, "r", encoding="utf-8") as f:
+    with open(args.md_path, "r", encoding="utf-8") as f:
         md = f.read()
     md = preprocess_display_math(md)
 
@@ -165,6 +285,8 @@ def main():
     }
 
     blocks = markdown_to_blocks(md, options)   # note: pass options as 2nd positional arg
+    blocks = sanitize_blocks_for_notion(blocks)
+    find_oversize_rich_text(blocks)
     total = len(blocks)
     print(f"\nConverted markdown -> {total} blocks")
 
@@ -214,7 +336,7 @@ def main():
                 # Validation/payload issues: shrink batch and retry (often fixes 500KB payload issues). :contentReference[oaicite:7]{index=7}
                 if getattr(e, "status", None) == 400 or getattr(e, "code", "") == "validation_error":
                     if len(batch) == 1:
-                        msg = f"❌ Block {i} failed validation: {str(e)}"
+                        msg = f"❌ Block {i} failed validation: {str(e)} (type={batch[0].get('type')})"
                         if args.skip_bad_blocks:
                             print(msg + " — skipping it.")
                             i += 1
